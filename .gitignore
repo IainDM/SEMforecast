@@ -1,0 +1,13 @@
+.env
+data/raw/
+data/commodities/
+data/processed/
+reports/
+*.jld2
+*.bson
+*.jls
+models_cache/
+*.swp
+.DS_Store
+.vscode/
+.idea/

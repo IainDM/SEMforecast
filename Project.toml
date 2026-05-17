@@ -1,0 +1,26 @@
+name = "SEMforecast"
+uuid = "5e3b29c1-7d4a-4a2f-9b86-1a5e6c3a8d22"
+authors = ["SEMforecast contributors"]
+version = "0.1.0"
+
+[deps]
+ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
+Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+EvoTrees = "f6006082-12f8-11e9-0c9c-0d5d367ab1e5"
+EzXML = "8f5d6c58-4d21-5cfd-889c-e3ad7ee6a615"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
+TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
+
+[compat]
+julia = "1.10"
