@@ -17,8 +17,17 @@ using Logging
 using Printf
 
 using SEMforecast
-using SEMforecast: Config, Entsoe, Commodities,
+using SEMforecast: Config, Entsoe, Commodities, Weather, Gb, ClimateIndices,
                    BasisFeatures, BasisBacktest, BasisReport, Conformal
+
+function _try_load(loader::Function, name::AbstractString)
+    try
+        return loader(name)
+    catch e
+        @warn "$name not loadable ($e); proceeding without it"
+        return nothing
+    end
+end
 
 function parse_args_()
     s = ArgParseSettings(description = "Walk-forward backtest: basis (ISP − DA) with abstention")
@@ -52,9 +61,19 @@ function main()
     imb = Entsoe.load("imbalance_prices")
     com = Commodities.load("commodities")
 
-    panel = BasisFeatures.build_basis_panel(prices = prices, load = load,
-                                            wind = wind, solar = solar,
-                                            commodities = com, imbalance = imb)
+    weather  = _try_load(Weather.load,        "weather")
+    gb_price = _try_load(Gb.load,             "gb_da_prices")
+    gb_wind  = _try_load(Gb.load,             "gb_wind_forecast")
+    outages  = _try_load(Entsoe.load,         "outages")
+    actuals  = _try_load(Entsoe.load,         "actuals")
+    nao      = _try_load(ClimateIndices.load, "nao_index")
+
+    panel = BasisFeatures.build_basis_panel(
+        prices = prices, load = load, wind = wind, solar = solar,
+        commodities = com, imbalance = imb,
+        weather = weather, gb_price = gb_price, gb_wind = gb_wind,
+        outages = outages, actuals = actuals, nao = nao,
+    )
     @info "Basis panel assembled" rows=nrow(panel) date_range=(minimum(panel.date), maximum(panel.date))
     basis_stats = (
         mean = sum(panel.basis) / nrow(panel),

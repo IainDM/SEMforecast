@@ -4,6 +4,10 @@ include("Config.jl")
 include("Calendar.jl")
 include("Entsoe.jl")
 include("Commodities.jl")
+# v2 data sources: weather (Met Éireann), GB (ELEXON BMRS), NAO (NOAA CPC)
+include("Weather.jl")
+include("Gb.jl")
+include("ClimateIndices.jl")
 include("Features.jl")
 include("Baseline.jl")
 include("Model.jl")
@@ -21,6 +25,9 @@ using .Config
 using .Calendar
 using .Entsoe
 using .Commodities
+using .Weather
+using .Gb
+using .ClimateIndices
 using .Features
 using .Baseline
 using .Model
@@ -32,8 +39,8 @@ using .Conformal
 using .BasisBacktest
 using .BasisReport
 
-export Config, Calendar, Entsoe, Commodities, Features,
-       Baseline, Model, Backtest, Report,
+export Config, Calendar, Entsoe, Commodities, Weather, Gb, ClimateIndices,
+       Features, Baseline, Model, Backtest, Report,
        BasisFeatures, QuantileModel, Conformal, BasisBacktest, BasisReport
 
 end # module

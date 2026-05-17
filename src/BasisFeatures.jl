@@ -21,17 +21,29 @@ function _to_local(df::DataFrame)
 end
 
 """
-    build_basis_panel(; prices, load, wind, solar, commodities, imbalance) -> DataFrame
+    build_basis_panel(; prices, load, wind, solar, commodities, imbalance,
+                        weather = nothing, gb_price = nothing,
+                        gb_wind = nothing, outages = nothing,
+                        actuals = nothing, nao = nothing) -> DataFrame
 
-Inner-joins ISP onto the DAM panel. Returns one row per (date, hour) carrying
-both the day-ahead price (`price`) and the imbalance settlement price (`isp`).
+Inner-joins ISP onto the DAM panel. The optional weather/GB/outages/actuals/NAO
+args are passed through to `Features.build_panel`.
 """
 function build_basis_panel(; prices::DataFrame, load::DataFrame, wind::DataFrame,
                             solar::DataFrame, commodities::DataFrame,
-                            imbalance::DataFrame)
-    panel = Features.build_panel(prices = prices, load = load,
-                                 wind = wind, solar = solar,
-                                 commodities = commodities)
+                            imbalance::DataFrame,
+                            weather::Union{Nothing,DataFrame} = nothing,
+                            gb_price::Union{Nothing,DataFrame} = nothing,
+                            gb_wind::Union{Nothing,DataFrame}  = nothing,
+                            outages::Union{Nothing,DataFrame}  = nothing,
+                            actuals::Union{Nothing,DataFrame}  = nothing,
+                            nao::Union{Nothing,DataFrame}      = nothing)
+    panel = Features.build_panel(
+        prices = prices, load = load, wind = wind, solar = solar,
+        commodities = commodities,
+        weather = weather, gb_price = gb_price, gb_wind = gb_wind,
+        outages = outages, actuals = actuals, nao = nao,
+    )
     isp = _to_local(imbalance)
     isp_d = combine(groupby(isp, [:date, :hour]), :isp => mean => :isp)
     out = innerjoin(panel, isp_d, on = [:date, :hour])
@@ -64,54 +76,40 @@ Features added:
     basis_daily_mean_d_minus_1, basis_sign_yday (categorical regime)
 """
 function add_basis_features(panel::DataFrame)
-    df = copy(panel)
-    df.dow            = dayofweek.(df.date)
-    df.is_weekend     = Int.(df.dow .>= 6)
-    df.is_holiday_ie  = Int.(Calendar.is_holiday_ie.(df.date))
-    df.is_holiday_uk  = Int.(Calendar.is_holiday_uk.(df.date))
-    df.month          = month.(df.date)
-    doy               = dayofyear.(df.date)
-    df.sin_doy        = sin.(2π .* doy ./ 365.25)
-    df.cos_doy        = cos.(2π .* doy ./ 365.25)
-    df.sin_hour       = sin.(2π .* df.hour ./ 24.0)
-    df.cos_hour       = cos.(2π .* df.hour ./ 24.0)
+    # Reuse the full DAM-side feature engineering: calendar, weather, GB,
+    # outages, commodities, lagged prices, recent regime flags, rolling
+    # forecast-MAE, etc. — all the v2 features are inherited.
+    df = Features.add_features(panel)
 
+    # ----- Basis-target-specific extras layered on top -----
     df.da_price = df.price
-    df.residual_demand = df.load_fcst .- df.wind_fcst .- df.solar_fcst
     df.wind_share = df.wind_fcst ./ max.(df.load_fcst, 1.0)
 
-    # Daily summaries known at predict time (DA prices are all known at once).
+    # Daily DA-price summaries (known at predict time since all 24h of D
+    # cleared together in the auction).
     daily = combine(groupby(df, :date),
-        :price     => mean    => :da_daily_mean,
-        :price     => (x -> maximum(x) - minimum(x)) => :da_daily_range,
-        :load_fcst => maximum => :daily_peak_load_fcst,
-        :wind_fcst => mean    => :daily_mean_wind_fcst,
-    )
+        :price => mean                              => :da_daily_mean,
+        :price => (x -> maximum(x) - minimum(x))    => :da_daily_range)
     df = leftjoin(df, daily, on = :date)
     df.da_price_minus_daymean = df.da_price .- df.da_daily_mean
 
-    # 30-day rolling z-score / rank of residual demand and DA price.
-    # Computed per (date, hour) using only data strictly earlier than date.
+    # 30-day per-hour-of-day rolling z-score / rank.
     sort!(df, [:date, :hour])
     idx_dh = Dict{Tuple{Date,Int},Int}()
     for i in 1:nrow(df)
         idx_dh[(df.date[i], df.hour[i])] = i
     end
-
     df.residual_demand_z = Vector{Union{Missing,Float64}}(undef, nrow(df))
     df.da_price_rank_30d = Vector{Union{Missing,Float64}}(undef, nrow(df))
-
-    # Build a per-hour-of-day rolling window using sliding indices.
     for h in 0:23
-        rows = sort([i for i in 1:nrow(df) if df.hour[i] == h], by = i -> df.date[i])
+        rows = sort([i for i in 1:nrow(df) if df.hour[i] == h],
+                    by = i -> df.date[i])
         rd_buf = Float64[]
         da_buf = Float64[]
-        # Sliding window of last 30 same-hour observations.
-        for (k, i) in enumerate(rows)
+        for i in rows
             if length(rd_buf) >= 5
                 μ = mean(rd_buf); σ = std(rd_buf)
                 df.residual_demand_z[i] = σ > 1e-6 ? (df.residual_demand[i] - μ) / σ : 0.0
-                # Empirical rank in [0, 1] of da_price within recent window.
                 df.da_price_rank_30d[i] = mean(da_buf .<= df.da_price[i])
             else
                 df.residual_demand_z[i] = missing
@@ -125,7 +123,7 @@ function add_basis_features(panel::DataFrame)
         end
     end
 
-    # Lagged basis features (basis from days strictly before D is known).
+    # Lagged basis features.
     function _lag_basis(d::Date, h::Int, days_back::Int)
         k = (d - Day(days_back), h)
         haskey(idx_dh, k) || return missing
@@ -161,6 +159,18 @@ function add_basis_features(panel::DataFrame)
         df.basis_sign_yday[i] = ismissing(yday) ? missing : Float64(sign(yday))
     end
 
+    # ----- Basis-specific cross-market signal: IE−GB spread yesterday -----
+    if :gb_price_lag_24h in propertynames(df)
+        # da_price[D,h] − gb_price[D-1,h] (proxy for the cross-market regime
+        # at the same delivery hour yesterday). Today's GB price is on the panel
+        # — use it directly when present.
+        if :gb_price in propertynames(df)
+            df.ie_gb_spread = df.da_price .- coalesce.(df.gb_price, df.gb_price_lag_24h)
+        else
+            df.ie_gb_spread = df.da_price .- df.gb_price_lag_24h
+        end
+    end
+
     required = [:basis, :da_price, :load_fcst, :wind_fcst, :residual_demand,
                 :basis_lag_24h, :basis_lag_168h, :basis_roll7_same_hour,
                 :residual_demand_z, :da_price_rank_30d]
@@ -171,15 +181,28 @@ end
 """
     basis_feature_columns(df)
 
-Model input columns: everything except the target (`basis`), the ISP itself
-(would be leakage), and bookkeeping. Importantly, `price` (a.k.a. `da_price`)
-is allowed because the DA price is the conditioner — we predict basis given
-the DA price has cleared.
+Model input columns. Excludes:
+  - target (`basis`) and its component (`isp`)
+  - bookkeeping (`ts_utc`, `ts_local`, `date`)
+  - daily mean price (intermediate derived column)
+  - post-delivery actuals (`wind_actual`, `load_actual`)
+  - same-hour unplanned outages (`unplanned_outage_mw`, `large_outage_flag`) —
+    these can include events not yet visible at predict time. `outage_capacity_mw`
+    is kept since planned outages are knowable.
+
+`price` / `da_price` is allowed because the DA price has cleared at predict time
+and conditions the basis. `gb_price` (today's value) is also allowed because GB
+DAM clears in the same window as SEM DAM.
 """
 function basis_feature_columns(df::DataFrame)
-    exclude = Set([:basis, :isp, :ts_utc, :ts_local, :date,
-                   :daily_mean_price,
-                   :daily_mean_price_d_minus_1])  # comes from Features.add_features path; not present here, safe to ignore
+    exclude = Set([
+        :basis, :isp, :ts_utc, :ts_local, :date,
+        :daily_mean_price,
+        # post-delivery
+        :wind_actual, :load_actual,
+        # potential same-hour leakage; lag_24h variants are the safe features
+        :unplanned_outage_mw, :large_outage_flag,
+    ])
     return [c for c in propertynames(df) if !(c in exclude)]
 end
 

@@ -14,7 +14,20 @@ using Logging
 using Printf
 
 using SEMforecast
-using SEMforecast: Config, Entsoe, Commodities, Features, Backtest, Report
+using SEMforecast: Config, Entsoe, Commodities, Weather, Gb, ClimateIndices,
+                   Features, Backtest, Report
+
+# Defensive optional-load helper: try to load each cached file; return `nothing`
+# (and warn) if the file isn't there. Lets the pipeline degrade gracefully if
+# a data source is missing rather than blocking the whole backtest.
+function _try_load(loader::Function, name::AbstractString)
+    try
+        return loader(name)
+    catch e
+        @warn "$name not loadable ($e); proceeding without it"
+        return nothing
+    end
+end
 
 function parse_args_()
     s = ArgParseSettings(description = "Walk-forward backtest")
@@ -44,8 +57,19 @@ function main()
     end
     com = Commodities.load("commodities")
 
-    panel = Features.build_panel(prices = prices, load = load,
-                                 wind = wind, solar = solar, commodities = com)
+    # v2 optional sources — degrade gracefully if any is missing.
+    weather  = _try_load(Weather.load,        "weather")
+    gb_price = _try_load(Gb.load,             "gb_da_prices")
+    gb_wind  = _try_load(Gb.load,             "gb_wind_forecast")
+    outages  = _try_load(Entsoe.load,         "outages")
+    actuals  = _try_load(Entsoe.load,         "actuals")
+    nao      = _try_load(ClimateIndices.load, "nao_index")
+
+    panel = Features.build_panel(
+        prices = prices, load = load, wind = wind, solar = solar, commodities = com,
+        weather = weather, gb_price = gb_price, gb_wind = gb_wind,
+        outages = outages, actuals = actuals, nao = nao,
+    )
     @info "Panel assembled" rows=nrow(panel) date_range=(minimum(panel.date), maximum(panel.date))
 
     eval_start = Date(args["eval-start"])

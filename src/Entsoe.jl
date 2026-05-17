@@ -292,94 +292,250 @@ function fetch_imbalance_prices(start_date::Date, end_date::Date)
     return df
 end
 
+"""
+    fetch_outages(start_date, end_date) -> DataFrame
+
+Generator outage / unavailability documents (ENTSO-E A77 — production and
+consumption unit outages). For each hour we aggregate total offline capacity
+across all units with active outage windows.
+
+The full A77 document has rich structure (per-unit, per-business-type,
+planned vs forced). This helper returns the hourly aggregate that drives
+short-run scarcity pricing; if the caller needs the per-unit detail they
+should extend `_parse_outages` below.
+
+Columns: `ts_utc::DateTime`, `outage_capacity_mw::Float64`,
+`unplanned_outage_mw::Float64`, `large_outage_flag::Int` (1 if any single
+unit >300 MW offline in that hour, else 0).
+"""
+function fetch_outages(start_date::Date, end_date::Date)
+    base = Dict(
+        "documentType" => "A77",
+        "biddingZone_Domain" => Config.SEM_EIC,
+    )
+    out = Tuple{DateTime,Float64,Float64,Int}[]
+    for (a, b) in _chunks(start_date, end_date)
+        params = copy(base)
+        params["periodStart"] = _entsoe_period(ZonedDateTime(DateTime(a), tz"UTC"))
+        params["periodEnd"]   = _entsoe_period(ZonedDateTime(DateTime(b), tz"UTC"))
+        doc = _request(params)
+        _is_no_data(doc) && continue
+        append!(out, _parse_outages(doc))
+        sleep(0.4)
+    end
+    isempty(out) && return DataFrame(ts_utc = DateTime[],
+        outage_capacity_mw = Float64[], unplanned_outage_mw = Float64[],
+        large_outage_flag = Int[])
+    return _aggregate_outages(out)
+end
+
+# Per-document parse: emit one row per (timestamp, available_capacity,
+# nominal_capacity, businessType). For SEM, nominal_capacity is in the
+# Production Unit; we read both fields.
+function _parse_outages(doc)
+    rows = Tuple{DateTime,Float64,Float64,Int}[]  # ts, offline_mw, unplanned_mw, large_flag
+    for ts_node in _timeseries_nodes(doc)
+        # businessType: "A53" planned, "A54" unplanned
+        btype = _child_text(ts_node, "businessType")
+        unplanned = btype == "A54"
+        # nominalCapacity is in nested ProductionRegisteredResource node.
+        nominal = let n = _first_child(ts_node, "ProductionRegisteredResource_nominalCapacity")
+            n === nothing ? 0.0 :
+                let v = _child_text(n, "value"); v === nothing ? 0.0 : parse(Float64, v) end
+        end
+        for period in _children(ts_node, "Period")
+            ti = _first_child(period, "timeInterval")
+            ti === nothing && continue
+            start_text = _child_text(ti, "start"); start_text === nothing && continue
+            start_utc = _parse_utc(start_text)
+            res_text = _child_text(period, "resolution"); res_text === nothing && continue
+            step = _parse_resolution(res_text)
+            for pt in _children(period, "Point")
+                pos_text = _child_text(pt, "position")
+                qty_text = _child_text(pt, "quantity")
+                (pos_text === nothing || qty_text === nothing) && continue
+                pos = parse(Int, pos_text)
+                avail = parse(Float64, qty_text)
+                offline = max(0.0, nominal - avail)
+                ts = start_utc + step * (pos - 1)
+                large = (offline > 300.0) ? 1 : 0
+                push!(rows, (ts, offline, unplanned ? offline : 0.0, large))
+            end
+        end
+    end
+    return rows
+end
+
+# Bucket the (potentially overlapping, multi-unit) rows to hourly aggregates.
+function _aggregate_outages(rows::Vector{Tuple{DateTime,Float64,Float64,Int}})
+    sort!(rows; by = r -> r[1])
+    buckets = Dict{DateTime,Vector{Tuple{Float64,Float64,Int}}}()
+    for (ts, offline, unplanned, large) in rows
+        h = floor(ts, Hour)
+        push!(get!(buckets, h, Tuple{Float64,Float64,Int}[]), (offline, unplanned, large))
+    end
+    ks = sort(collect(keys(buckets)))
+    return DataFrame(
+        ts_utc              = ks,
+        outage_capacity_mw  = [sum(first.(buckets[k])) for k in ks],
+        unplanned_outage_mw = [sum(getindex.(buckets[k], 2)) for k in ks],
+        large_outage_flag   = [maximum(getindex.(buckets[k], 3)) for k in ks],
+    )
+end
+
 # ---------------------------------------------------------------------------
 # Synthetic data for offline smoke tests
 # ---------------------------------------------------------------------------
 
 """
-    synthetic_dataset(start_date, end_date)
+    synthetic_dataset(start_date, end_date; weather_df = nothing, seed = 42)
 
-Generates plausible SEM-like hourly series (price, load_fcst, wind_fcst,
-solar_fcst) without hitting the network. Captures the broad structure: daily
-double-peak demand, weekly cycle, wind-driven price suppression, occasional
-spikes. Useful for end-to-end pipeline tests without an API token.
+Generates plausible SEM-like hourly series. When `weather_df` is supplied
+(from `Weather.synthetic_weather`), the realised wind generation, demand,
+and forecast errors are **causally driven** by the weather signal — this
+is what makes weather features genuinely predictive in the synthetic
+backtest. Without it, the function falls back to the pre-weather model.
+
+The function also generates generator outages as a Poisson process of
+single-unit trips (300–500 MW lasting 6–36 hours) plus a smaller background
+of planned outages, and emits actual (post-delivery) load + wind so the
+rolling forecast-MAE features have something to bite on.
+
+Returned named tuple keys:
+  prices, load, wind, solar, imbalance,
+  actuals (load_actual, wind_actual),
+  outages (outage_capacity_mw, unplanned_outage_mw, large_outage_flag).
 """
-function synthetic_dataset(start_date::Date, end_date::Date; seed::Int = 42)
+function synthetic_dataset(start_date::Date, end_date::Date;
+                           weather_df::Union{Nothing,DataFrame} = nothing,
+                           seed::Int = 42)
     rng = MersenneTwister(seed)
-    hours_per_day = 24
     n_days = Dates.value(end_date - start_date)
-    n = n_days * hours_per_day
-    base_dt = DateTime(start_date)
-    ts = [base_dt + Hour(i) for i in 0:n-1]
+    n = n_days * 24
+    ts = [DateTime(start_date) + Hour(i) for i in 0:n-1]
 
-    load = Vector{Float64}(undef, n)
-    wind = Vector{Float64}(undef, n)
-    solar = Vector{Float64}(undef, n)
-    price = Vector{Float64}(undef, n)
-    isp   = Vector{Float64}(undef, n)
+    # ----- Weather-derived wind regime -----
+    if weather_df === nothing
+        # Fallback: deterministic seasonal + diurnal pattern with noise.
+        avg_coastal_wind = [10.0 + 5.0 * sin(2π * i / (24 * 5)) +
+                            2.5 * sin(2π * i / 24) + randn(rng) for i in 1:n]
+        temp_dub = [10.0 + 7.0 * sin(2π * (i / (24 * 365.25) - 0.25)) +
+                    3.0 * sin(2π * (mod(i,24) - 4)/24) + randn(rng) for i in 1:n]
+    else
+        # Use weather as the causal driver.
+        w = sort(weather_df, :ts_utc)
+        # Align weather to our timestamps — assume same start.
+        @assert nrow(w) >= n "weather_df shorter than synthetic horizon"
+        avg_coastal_wind = (w.wind_mace_head[1:n] .+ w.wind_belmullet[1:n] .+
+                             w.wind_malin_head[1:n] .+ w.wind_valentia[1:n] .+
+                             w.wind_roches_point[1:n]) ./ 5.0
+        temp_dub = w.temp_dublin[1:n]
+    end
 
-    # Persistent error innovations (mimic real-time residual demand surprises).
+    # ----- Outages: Poisson trips + slow-moving planned -----
+    outage_capacity_mw  = zeros(Float64, n)
+    unplanned_outage_mw = zeros(Float64, n)
+    large_outage_flag   = zeros(Int, n)
+    # Baseline planned outage drifting around 600 MW.
+    planned = Vector{Float64}(undef, n)
+    planned[1] = 600.0
+    for i in 2:n
+        planned[i] = max(200.0, planned[i-1] + 50.0 * randn(rng))
+    end
+    outage_capacity_mw .+= planned
+    # Unplanned trip events: rare large-unit failures.
+    for _ in 1:max(1, n ÷ (24 * 18))      # ~one trip every ~18 days on average
+        i0 = rand(rng, 1:n)
+        mw  = 250.0 + 250.0 * rand(rng)
+        dur = rand(rng, 6:36)
+        for k in i0:min(i0 + dur - 1, n)
+            outage_capacity_mw[k]  += mw
+            unplanned_outage_mw[k] += mw
+            mw > 300.0 && (large_outage_flag[k] = 1)
+        end
+    end
+
+    # ----- Realised wind, load -----
+    wind_actual = Vector{Float64}(undef, n)
+    load_actual = Vector{Float64}(undef, n)
+    solar       = Vector{Float64}(undef, n)
+    wind_fcst   = Vector{Float64}(undef, n)
+    load_fcst   = Vector{Float64}(undef, n)
+    price       = Vector{Float64}(undef, n)
+    isp         = Vector{Float64}(undef, n)
+
+    # Persistent forecast-error innovations.
     re_load = randn(rng, n) .* 250.0
-    re_wind = randn(rng, n) .* 400.0
+    re_wind_base = randn(rng, n) .* 400.0
 
     for i in 1:n
         t = ts[i]
         h = hour(t)
         dow = dayofweek(t)
-        wknd_mul = (dow >= 6) ? 0.85 : 1.0
-        # Two-peak demand pattern (morning 8-9, evening 18-20).
-        load[i] = 3500 + 1200 * exp(-((h-8.5)^2)/8) +
-                  1800 * exp(-((h-19)^2)/6) + 200 * randn(rng)
-        load[i] *= wknd_mul
+        wknd = (dow >= 6) ? 0.85 : 1.0
 
-        # Wind: slow-changing random walk + diurnal noise.
-        wind[i] = max(0.0, 1500 + 1000 * sin(2π * i / (24*5)) +
-                            500 * sin(2π * i / 24) + 300 * randn(rng))
+        # Realised wind generation driven by measured coastal wind speed
+        # (kt → MW via a saturating logistic; IE installed capacity ~5.5 GW).
+        w = avg_coastal_wind[i]
+        wind_actual[i] = 5500.0 / (1.0 + exp(-(w - 12.0) / 4.0))
+        # Forecast error scales with regime — high wind = larger absolute MAE.
+        err_scale = 1.0 + 0.05 * max(w, 0.0)
+        wind_fcst[i] = max(0.0, wind_actual[i] + re_wind_base[i] * err_scale)
 
-        # Solar: bell-shaped during daylight, zero overnight, small in SEM.
+        # Demand: base shape modulated by temperature (heating-degree-days).
+        hdd = max(0.0, 15.5 - temp_dub[i])
+        cdd = max(0.0, temp_dub[i] - 22.0)
+        load_actual[i] = (3300.0 +
+                          1200.0 * exp(-((h - 8.5)^2)/8) +
+                          1800.0 * exp(-((h - 19)^2)/6) +
+                          45.0 * hdd + 60.0 * cdd) * wknd + 100.0 * randn(rng)
+        load_fcst[i] = max(0.0, load_actual[i] + re_load[i])
+
+        # Solar (small in SEM): same forecast = actual.
         solar[i] = (h >= 6 && h <= 20) ?
-                   max(0.0, 150 * exp(-((h-13)^2)/12) + 30 * randn(rng)) :
-                   0.0
+                   max(0.0, 150 * exp(-((h-13)^2)/12) + 30 * randn(rng)) : 0.0
 
-        # Price ~ residual-demand driven, with floor and occasional spike.
-        residual = load[i] - wind[i] - solar[i]
-        price[i] = 20.0 + 0.025 * max(residual, 0.0) + 5 * randn(rng)
-        if rand(rng) < 0.003
-            price[i] += 200 * rand(rng)  # spike
-        end
+        # DAM price: function of FORECAST residual demand (known at auction)
+        # minus available capacity (planned outages reduce supply).
+        residual_fcst = load_fcst[i] - wind_fcst[i] - solar[i]
+        # Scarcity premium grows non-linearly as outages bite.
+        scarcity = 0.020 * max(residual_fcst + outage_capacity_mw[i] - 4500.0, 0.0)
+        price[i] = 20.0 + 0.022 * max(residual_fcst, 0.0) +
+                   0.5 * scarcity +
+                   5.0 * randn(rng)
+        # Rare spike on top.
+        rand(rng) < 0.003 && (price[i] += 200.0 * rand(rng))
         price[i] = max(-50.0, price[i])
 
-        # Imbalance Settlement Price = DA + structured basis + noise.
-        # Structural drivers:
-        #   - tight system pushes ISP > DA (residual demand effect, non-linear)
-        #   - load forecast error: positive error => ISP > DA
-        #   - wind forecast error: positive error (more wind than expected) => ISP < DA
-        #   - small diurnal pattern (peak hours have larger basis variance)
-        #   - persistence at same hour yesterday
-        tight = (residual - 3500.0) / 1500.0       # roughly N(0,1) at peak hours
-        load_err = re_load[i]
-        wind_err = re_wind[i]
-        diurnal_basis = 1.5 * sin(2π * (h - 4) / 24)
+        # ISP = DA + structured basis + noise. Now also driven by:
+        #   - realised residual demand vs forecast (the "auction surprise")
+        #   - unplanned outages happening during delivery
+        residual_real = load_actual[i] - wind_actual[i] - solar[i]
+        surprise = residual_real - residual_fcst   # positive = system tighter than expected
+        tight = (residual_fcst - 3500.0) / 1500.0
         prev_basis = (i > 24) ? (isp[i-24] - price[i-24]) : 0.0
         structured = 4.0 * max(tight, 0.0)^2 * sign(tight) +
-                     0.012 * load_err -
-                     0.010 * wind_err +
-                     diurnal_basis +
+                     0.012 * surprise +
+                     0.025 * unplanned_outage_mw[i] +
+                     1.5 * sin(2π * (h - 4) / 24) +
                      0.35 * prev_basis
-        # Noise scales with regime: peak hours and high-wind hours are noisier.
-        noise_scale = 2.5 + 1.5 * exp(-((h-19)^2)/12) + 0.0015 * wind[i]
-        noise = noise_scale * randn(rng)
-        # Heavy tail: occasional large basis spike.
+        noise_scale = 2.5 + 1.5 * exp(-((h-19)^2)/12) + 0.0015 * wind_actual[i]
         spike = (rand(rng) < 0.01) ? (rand(rng) < 0.5 ? -1 : 1) * (15.0 + 30.0 * rand(rng)) : 0.0
-        isp[i] = max(-100.0, price[i] + structured + noise + spike)
+        isp[i] = max(-100.0, price[i] + structured + noise_scale * randn(rng) + spike)
     end
 
     return (
         prices    = DataFrame(ts_utc = ts, price     = price),
-        load      = DataFrame(ts_utc = ts, load_fcst = load),
-        wind      = DataFrame(ts_utc = ts, wind_fcst = wind),
-        solar     = DataFrame(ts_utc = ts, solar_fcst= solar),
+        load      = DataFrame(ts_utc = ts, load_fcst = load_fcst),
+        wind      = DataFrame(ts_utc = ts, wind_fcst = wind_fcst),
+        solar     = DataFrame(ts_utc = ts, solar_fcst = solar),
         imbalance = DataFrame(ts_utc = ts, isp       = isp),
+        actuals   = DataFrame(ts_utc = ts, load_actual = load_actual,
+                              wind_actual = wind_actual),
+        outages   = DataFrame(ts_utc = ts,
+                              outage_capacity_mw = outage_capacity_mw,
+                              unplanned_outage_mw = unplanned_outage_mw,
+                              large_outage_flag = large_outage_flag),
     )
 end
 
