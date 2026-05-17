@@ -273,6 +273,25 @@ function fetch_solar_forecast(start_date::Date, end_date::Date)
     end
 end
 
+"""
+    fetch_imbalance_prices(start_date, end_date) -> DataFrame
+
+Imbalance settlement price (ENTSO-E A85). SEM publishes this half-hourly; the
+parser aggregates to hourly (mean of two settlement periods) so the series is
+directly comparable with the hourly day-ahead price.
+
+Columns: `ts_utc::DateTime`, `isp::Float64` (€/MWh).
+"""
+function fetch_imbalance_prices(start_date::Date, end_date::Date)
+    params = Dict(
+        "documentType"        => "A85",
+        "controlArea_Domain"  => Config.SEM_EIC,
+    )
+    df = _fetch_series(params, "price.amount", start_date, end_date)
+    rename!(df, :value => :isp)
+    return df
+end
+
 # ---------------------------------------------------------------------------
 # Synthetic data for offline smoke tests
 # ---------------------------------------------------------------------------
@@ -293,11 +312,15 @@ function synthetic_dataset(start_date::Date, end_date::Date; seed::Int = 42)
     base_dt = DateTime(start_date)
     ts = [base_dt + Hour(i) for i in 0:n-1]
 
-    # Load profile: morning + evening peaks, weekday/weekend modulation.
     load = Vector{Float64}(undef, n)
     wind = Vector{Float64}(undef, n)
     solar = Vector{Float64}(undef, n)
     price = Vector{Float64}(undef, n)
+    isp   = Vector{Float64}(undef, n)
+
+    # Persistent error innovations (mimic real-time residual demand surprises).
+    re_load = randn(rng, n) .* 250.0
+    re_wind = randn(rng, n) .* 400.0
 
     for i in 1:n
         t = ts[i]
@@ -325,6 +348,30 @@ function synthetic_dataset(start_date::Date, end_date::Date; seed::Int = 42)
             price[i] += 200 * rand(rng)  # spike
         end
         price[i] = max(-50.0, price[i])
+
+        # Imbalance Settlement Price = DA + structured basis + noise.
+        # Structural drivers:
+        #   - tight system pushes ISP > DA (residual demand effect, non-linear)
+        #   - load forecast error: positive error => ISP > DA
+        #   - wind forecast error: positive error (more wind than expected) => ISP < DA
+        #   - small diurnal pattern (peak hours have larger basis variance)
+        #   - persistence at same hour yesterday
+        tight = (residual - 3500.0) / 1500.0       # roughly N(0,1) at peak hours
+        load_err = re_load[i]
+        wind_err = re_wind[i]
+        diurnal_basis = 1.5 * sin(2π * (h - 4) / 24)
+        prev_basis = (i > 24) ? (isp[i-24] - price[i-24]) : 0.0
+        structured = 4.0 * max(tight, 0.0)^2 * sign(tight) +
+                     0.012 * load_err -
+                     0.010 * wind_err +
+                     diurnal_basis +
+                     0.35 * prev_basis
+        # Noise scales with regime: peak hours and high-wind hours are noisier.
+        noise_scale = 2.5 + 1.5 * exp(-((h-19)^2)/12) + 0.0015 * wind[i]
+        noise = noise_scale * randn(rng)
+        # Heavy tail: occasional large basis spike.
+        spike = (rand(rng) < 0.01) ? (rand(rng) < 0.5 ? -1 : 1) * (15.0 + 30.0 * rand(rng)) : 0.0
+        isp[i] = max(-100.0, price[i] + structured + noise + spike)
     end
 
     return (
@@ -332,6 +379,7 @@ function synthetic_dataset(start_date::Date, end_date::Date; seed::Int = 42)
         load      = DataFrame(ts_utc = ts, load_fcst = load),
         wind      = DataFrame(ts_utc = ts, wind_fcst = wind),
         solar     = DataFrame(ts_utc = ts, solar_fcst= solar),
+        imbalance = DataFrame(ts_utc = ts, isp       = isp),
     )
 end
 

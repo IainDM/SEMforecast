@@ -10,19 +10,25 @@ backtest.
 
 ```
 src/
-  Config.jl         constants, paths, .env loader
-  Calendar.jl       Irish + UK bank holidays (incl. NI dates, St Brigid's)
-  Entsoe.jl         REST client for the ENTSO-E Transparency Platform
-  Commodities.jl    Yahoo Finance fetch for TTF gas + EUA carbon
-  Features.jl       feature engineering (calendar, lags, residual demand, ...)
-  Baseline.jl       the naive D-1 same-hour benchmark
-  Model.jl          EvoTrees gradient-boosted regressor (MAE loss)
-  Backtest.jl       walk-forward evaluation
-  Report.jl         metrics + matplotlib-style charts via Plots.jl
+  Config.jl          constants, paths, .env loader
+  Calendar.jl        Irish + UK bank holidays (incl. NI dates, St Brigid's)
+  Entsoe.jl          REST client for the ENTSO-E Transparency Platform
+  Commodities.jl     Yahoo Finance fetch for TTF gas + EUA carbon
+  Features.jl        feature engineering (calendar, lags, residual demand, ...)
+  Baseline.jl        the naive D-1 same-hour benchmark
+  Model.jl           EvoTrees gradient-boosted regressor (MAE loss)
+  Backtest.jl        walk-forward evaluation
+  Report.jl          metrics + matplotlib-style charts via Plots.jl
+  BasisFeatures.jl   features for the ISP − DA basis target
+  QuantileModel.jl   EvoTrees quantile trio at q10 / q50 / q90
+  Conformal.jl       split-conformal CQR + UP/DOWN/ABSTAIN decision rule
+  BasisBacktest.jl   walk-forward eval + selective-prediction metrics
+  BasisReport.jl     basis-specific charts and markdown summary
 scripts/
-  fetch_data.jl     pulls & caches ENTSO-E + commodity data to data/
-  run_backtest.jl   runs the backtest, writes reports/backtest_<timestamp>/
-  train.jl          fits the final model on all data, serialises it
+  fetch_data.jl          pulls & caches ENTSO-E + commodity + ISP data
+  run_backtest.jl        DAM price backtest (reports/backtest_<ts>/)
+  train.jl               fits the final DAM model on all data
+  run_basis_backtest.jl  basis selective-prediction backtest (reports/basis_<ts>/)
 ```
 
 ## Setup
@@ -119,6 +125,103 @@ Headline metrics: MAE, RMSE, sMAPE; skill score = `1 − MAE_model / MAE_baselin
 
 ## Out of scope (v1)
 
-Hyperparameter sweeps; probabilistic / quantile forecasts; outage data;
-live inference scheduling; unit tests. The backtest skill score is the
-integration test.
+Hyperparameter sweeps; outage data; live inference scheduling; unit tests.
+The backtest skill score is the integration test.
+
+---
+
+# Bonus: Basis (ISP − DA) selective forecast
+
+A second model predicts whether the **imbalance settlement price (ISP)** —
+the half-hourly post-delivery cash-out price, aggregated to hourly — will
+end up **above or below** the day-ahead price for each hour, by how much,
+and with a confidence the model is allowed to refuse to commit to.
+
+The pitch is **asymmetric**: saying "I'm not sure" is free; saying "UP"
+when the basis goes the other way is bad. The model is built around that.
+
+## Approach
+
+- **Target:** `basis = isp_hourly − da_hourly` (€/MWh, can go either way).
+- **Prediction time:** just after the DAM auction clears for day D. The DA
+  price is known and conditioned on; nothing from day D's delivery itself
+  is used as a feature.
+- **Model:** three EvoTrees regressors with **quantile loss** at α ∈
+  {0.1, 0.5, 0.9}, sharing one feature set. Per-row crossing-quantile fixes
+  are applied so q10 ≤ q50 ≤ q90.
+- **Calibration:** [**conformalized quantile regression (CQR)**](https://arxiv.org/abs/1905.03222),
+  Romano, Patterson, Candès 2019. Split-conformal procedure: hold out the
+  last `calibration_days` of the training window, compute non-conformity
+  scores `max(q_lo − y, y − q_hi)`, take their `(1−α)` empirical quantile,
+  widen the [q_lo, q_hi] interval by that amount on test. This gives the
+  calibrated interval a finite-sample marginal-coverage guarantee on
+  exchangeable data.
+- **Decision rule (the "abstain"):**
+  - calibrated `lo > 0` → signal **UP**
+  - calibrated `hi < 0` → signal **DOWN**
+  - else → **ABSTAIN**
+  Confidence on a call = signed distance of the nearer bound from 0.
+
+The feature set adds basis-specific lags (basis at D−1, D−2, D−7 same hour),
+recent regime indicators (rolling DA-price percentile, residual-demand
+z-score), the DA price itself as conditioner, and DA-daily summary stats —
+on top of the calendar / load / wind / solar / commodity features the DAM
+model already uses.
+
+## Run
+
+```bash
+# (assumes scripts/fetch_data.jl --synthetic has been run — it now also
+#  produces data/raw/imbalance_prices.arrow)
+
+# Native CQR at 80% target coverage (very conservative — will likely
+# abstain almost always on noisy data; that's the point)
+julia --project=. scripts/run_basis_backtest.jl --eval-start 2025-11-01 --alpha 0.2
+
+# 50% target coverage — a more actionable confidence level
+julia --project=. scripts/run_basis_backtest.jl --eval-start 2025-11-01 --alpha 0.5
+```
+
+Each run writes `reports/basis_<timestamp>/` containing:
+- `metrics.json` — signal rate, selective accuracy, calibrated coverage, sharpness
+- `per_hour.csv` — per-hour breakdown
+- `coverage_curve.csv` — sweep over an interval-scale knob, so a downstream
+  user can pick the operating point that suits their cost/benefit trade-off
+- `basis_timeseries.png`, `predicted_vs_actual.png`,
+  `calibration_intervals.png`, `confidence_vs_accuracy.png`
+- `README.md` — markdown summary
+
+## Headline numbers on the synthetic dataset
+
+The synthetic basis is built to be predictable in regimes but mostly noise
+(mean ≈ 0, std ≈ 8.6 €/MWh, heavy tails). On 3 months of held-out test data
+(2025-11-01 → 2026-01-31, 2208 hours, weekly retrains):
+
+| α (target coverage) | signal rate | selective accuracy | empirical coverage |
+|---:|---:|---:|---:|
+| 0.2 (80%) | 0%  | n/a (never signals) | 80% |
+| 0.5 (50%) | 10% | **83%** | 51% |
+| (scale=0.3, ad-hoc tighter rule) | 36% | 74% | 29% |
+
+Read these as: **when the model does call a direction at 50% nominal
+coverage, it's right 83% of the time** — vs a 50% no-skill rate. It
+abstains on 90% of hours because, honestly, most hours are too close to
+zero basis to call confidently. The empirical interval coverage closely
+matches the nominal target, so the "I don't know" is statistically honest,
+not just heuristic.
+
+## Why these choices
+
+- **Quantile regression, not classification + magnitude regression**: one
+  model produces both the direction-with-confidence and the magnitude
+  forecast (q50). The interval is the natural carrier of uncertainty.
+- **Conformal calibration on top of quantile**: raw quantile predictions
+  aren't well-calibrated out of the box (gradient-boosted quantiles are
+  notoriously under- or over-confident depending on regime). CQR fixes
+  marginal coverage with a finite-sample guarantee.
+- **Abstention as a first-class output, not a post-hoc threshold**: the
+  model is built around the rule that an undecided interval is a valid
+  answer. This is the right behavior for the asymmetric loss the user
+  asked for.
+- **No information from delivery day**: features are strictly from the
+  information set at DAM clear time. No look-ahead, no leakage.
