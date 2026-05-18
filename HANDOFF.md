@@ -4,11 +4,14 @@
 
 You're continuing the SEM day-ahead price forecasting project. The previous
 session built a working DAM model (+36.5% MAE skill on real ENTSO-E data) and
-left three gaps. This session closed the **code** side of those gaps but
-could **not verify on real data** — `using SEMforecast` deadlocked in the
-Julia precompile cascade after my edits invalidated the cache, and 25+
-minutes of waiting produced no output. The code is ready; the verification
-needs your machine.
+left three gaps. This session closed the **code** side of all three gaps
+and **verified the A80 outage parser end-to-end on real ENTSO-E data**.
+Two real bugs surfaced in the process and were fixed. Full
+`fetch_data.jl` + `run_backtest.jl` against real data still pending on
+your machine — Julia's OpenSSL on this WSL setup can't validate the
+ENTSO-E cert chain (`unable to get local issuer certificate`), but
+`curl --ssl-revoke-best-effort` works fine, so I verified the parser by
+fetching ZIPs via curl and parsing them in Julia.
 
 ### What landed (code)
 
@@ -75,16 +78,46 @@ needs your machine.
 
 ### Verification status
 
-**Not verified on real data this session.** Code changes are based on:
-- Direct inspection of the live A80 XML structure (confirmed parser fields).
-- Synthetic-mode pipeline unchanged (the new fetch is only called in
-  real-data mode).
+**A80 outage parser — VERIFIED on real ENTSO-E data.** Probed the live A80
+endpoint with `documentType=A80&biddingZone_Domain=10Y1001A1001A59C&
+periodStart=202511010000&periodEnd=202511080000`. Got HTTP 200,
+`application/zip`, 6346 bytes. Inside: 6 XML files spanning 2025 outages.
+After fixes (see commit `c62ba5c`), the parser produced 8760 hourly rows
+covering 2025-01-01 → 2025-12-31 with:
+- `outage_capacity_mw` mean 669.9 MW, max 1187 MW
+- `large_outage_flag` set on 696 hours (~8% of year)
+These values are plausible for SEM's ~10 GW dispatchable fleet.
 
-**Why**: After my edits to `Weather.jl` and `Entsoe.jl`, `using SEMforecast`
-hung indefinitely (>25 min) on Julia 1.10 on Windows. The original
-`Manifest.toml` was also stale (pinned `Expat_jll = 2.8.0` which doesn't
-exist in current registries); I regenerated it under Julia 1.10 (commit
-includes the new Manifest with `ZipFile` added).
+**Two bugs surfaced and fixed during verification** (commit `c62ba5c`):
+1. `_parse_resolution` threw on `PT1M`. A80 docs commonly use this with
+   `curveType=A03` (piecewise-constant). Added `PT1M → Minute(1)`.
+2. A80 returns the full validity period for any outage event overlapping
+   the requested window. With yearly-chunked fetches, an event spanning a
+   chunk boundary would be returned twice and `_aggregate_outages` would
+   sum the duplicates. Now filter each chunk's expanded rows to the
+   chunk's `[chunk_a, chunk_b)` bounds before accumulating.
+
+**SEMO ISP CSV ingest — VERIFIED end-to-end** on sample CSVs with two
+naming conventions (`STARTTIME/IMBALANCE_PRICE` and
+`starttime/imbalance_settlement_price`): produced correct
+`DataFrame(ts_utc::DateTime, isp::Float64)` Arrow output, half-hourly →
+hourly mean aggregation correct (e.g. row 1 isp=43.80 = mean(42.50, 45.10)).
+
+**Met Éireann Weather.jl — NOT verified.** The host `cli.fusio.net` is
+unreachable from this WSL environment (connection timed out on :443 and
+:80). Code changes (Dublin ID + per-station try-catch) are small and
+straightforward; the per-station catch will keep the panel running even
+if one station fails.
+
+**Full fetch + backtest — NOT verified.** Julia's OpenSSL on this WSL
+setup fails the cert chain validation against `web-api.tp.entsoe.eu`. The
+fix is environment-specific (Julia's OpenSSL.jl isn't consuming the
+Mozilla bundle that `NetworkOptions.ca_roots_path()` claims to provide).
+Should work cleanly on your machine where you presumably ran fetches
+before. **Important**: re-enable Julia precompile when running on your
+machine (don't use `--compiled-modules=no`); we used it here as a
+workaround for a hang that may be specific to this environment's setup
+after my source edits invalidated the cache.
 
 ### Network reachability from this environment
 
@@ -106,19 +139,8 @@ issue.
 
 ### What you need to do to finish (in order)
 
-1. **Run the smoke test** (will use the now-rebuilt precompile cache; should
-   be fast):
-   ```
-   julia +1.10 --project=. -e 'using SEMforecast; println("OK")'
-   ```
-   If this still hangs, try:
-   ```
-   julia +1.10 --project=. -e 'using Pkg; Pkg.precompile()'
-   ```
-   and watch for stuck packages.
-
-2. **Probe Met Éireann from your network** (`cli.fusio.net` was unreachable
-   from here but should work from the user's machine):
+1. **Probe Met Éireann from your network** (`cli.fusio.net` was unreachable
+   from here but should work from your machine):
    ```
    curl -sSL --max-time 30 https://cli.fusio.net/cli/climate_data/webdata/hly532.csv | head
    ```
@@ -126,21 +148,21 @@ issue.
    different name, look up the correct ID in the Met Éireann historical
    station index.
 
-3. **Bulk fetch** (this hits ENTSO-E A80 for the first time on real data
+2. **Bulk fetch** (this hits ENTSO-E A80 for the first time on real data
    and Met Éireann from your network):
    ```
    julia +1.10 --project=. scripts/fetch_data.jl --start 2023-01-01 --end 2026-05-18
    ```
    Expect `_safe()` to log any per-source failures without killing the run.
 
-4. **Rerun the DAM backtest**:
+3. **Rerun the DAM backtest**:
    ```
    julia +1.10 --project=. scripts/run_backtest.jl --eval-start 2025-11-01 --eval-end 2026-04-30
    ```
    Compare new skill vs +36.5% baseline. Expected lift: +38-44% (weather +
    A80 outages combined).
 
-5. **For the basis backtest** — download SEMO ISP CSVs manually (sem-o.com
+4. **For the basis backtest** — download SEMO ISP CSVs manually (sem-o.com
    publication portal, BM-026 report) or use the discovered API. Drop the
    CSVs in `data/raw/isp_csvs/` (or wherever) and run:
    ```
@@ -150,16 +172,18 @@ issue.
 
 ### Risks I didn't get to retire
 
-- The A80 parser is built against a single probed XML (one TimeSeries, one
-  Point at position 1 quantity 0, resolution PT1M). Multi-point TimeSeries
-  (partial outages, ramped recoveries) should work per the algorithm but
-  haven't been tested. If real-data fetch shows odd values, look at
-  `_parse_outages_a80` in [src/Entsoe.jl](src/Entsoe.jl) — specifically the
-  Point lookup loop. The `nominalP unit="MAW"` field is assumed to be MW;
-  if `MAW` actually means megaampere-watts or some variant it may need
-  scaling.
+- The A80 parser was verified on the real ENTSO-E response. The 6 XML
+  files in the probe were all `businessType=A53` (planned), so the
+  `unplanned_outage_mw` column was all zero in the test. Once real fetch
+  hits an `A54` event, that column should populate — verify the value
+  makes sense.
+- Multi-point TimeSeries (partial outages, ramped recoveries) should work
+  per the algorithm but the probed sample had only single-Point series.
 - The Dublin Airport station ID (532) is my best-known canonical value;
   verify on first probe.
+- `nominalP unit="MAW"` is assumed to be megawatts. The IEC 62325 standard
+  defines MAW as megawatts (a typo-ish abbreviation for MW); my parser
+  reads the value as a Float64 in MW without any unit conversion.
 
 ---
 
