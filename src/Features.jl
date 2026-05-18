@@ -299,9 +299,17 @@ function add_features(panel::DataFrame)
                 key = (d - Day(k), h)
                 haskey(idx, key) || continue
                 ridx = idx[key]
-                wmae_val = abs(df.wind_fcst[ridx] - df.wind_actual[ridx])
-                lmae_val = abs(df.load_fcst[ridx] - df.load_actual[ridx])
-                push!(wmae, wmae_val); push!(lmae, lmae_val)
+                wa = df.wind_actual[ridx]; la = df.load_actual[ridx]
+                wf = df.wind_fcst[ridx];   lf = df.load_fcst[ridx]
+                # Real ENTSO-E data has occasional gaps in either series;
+                # skip lag-days where actuals or forecasts are missing for
+                # that hour rather than poison the Float64 buffer.
+                if !ismissing(wa) && !ismissing(wf)
+                    push!(wmae, abs(Float64(wf) - Float64(wa)))
+                end
+                if !ismissing(la) && !ismissing(lf)
+                    push!(lmae, abs(Float64(lf) - Float64(la)))
+                end
             end
             df.wind_fcst_mae_7d[i] = isempty(wmae) ? missing : mean(wmae)
             df.load_fcst_mae_7d[i] = isempty(lmae) ? missing : mean(lmae)

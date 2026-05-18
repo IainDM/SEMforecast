@@ -58,7 +58,25 @@ function main()
     catch
         DataFrame(ts_utc = DateTime[], solar_fcst = Float64[])
     end
-    imb = Entsoe.load("imbalance_prices")
+    imb = try
+        Entsoe.load("imbalance_prices")
+    catch
+        @error """
+        No imbalance settlement price cache at data/raw/imbalance_prices.arrow.
+
+        SEM does NOT publish ISP to the ENTSO-E A85 endpoint, so a normal
+        `fetch_data.jl` run cannot fill this gap. Options:
+
+          1. Drop a manually-prepared ISP DataFrame in
+             data/raw/imbalance_prices.arrow with columns
+             `ts_utc::DateTime, isp::Float64` (€/MWh). The SEMO publication
+             portal (sem-o.com) exports half-hourly ISP CSVs; aggregate to
+             hourly mean and save with Arrow.write.
+          2. Re-run scripts/fetch_data.jl --synthetic to use the synthetic
+             ISP series for an end-to-end demo without real ISP data.
+        """
+        rethrow()
+    end
     com = Commodities.load("commodities")
 
     weather  = _try_load(Weather.load,        "weather")

@@ -75,6 +75,50 @@ julia --project=. scripts/fetch_data.jl --synthetic --start 2022-01-01 --end 202
 julia --project=. scripts/run_backtest.jl --eval-start 2025-11-01
 ```
 
+## What ENTSO-E actually exposes for SEM
+
+Not everything maps cleanly to ENTSO-E document types. Confirmed on the live API:
+
+| Series | Endpoint | EIC | Status |
+|---|---|---|---|
+| Day-ahead price | `A44` | `10Y1001A1001A59C` (SEM) | ✓ full coverage |
+| Load forecast / actual | `A65` (A01 / A16) | **`10YIE-1001A00010`** (IE only — NI not separately published) | ✓ |
+| Wind forecast / actual | `A69` / `A75` (B19) | `10Y1001A1001A59C` (SEM) | ✓ |
+| Solar forecast | `A69` (B16) | `10Y1001A1001A59C` (SEM) | ✗ empty — SEM doesn't publish |
+| Imbalance settlement price | `A85` | (all variants) | ✗ **not on ENTSO-E** for SEM |
+| Generator outages | `A77` | (all variants) | ✗ empty; SEM uses **`A80`** (ZIP) |
+
+Practical impact:
+- **Basis (ISP − DA) model**: needs ISP. Source from the SEMO publication
+  portal (sem-o.com) and drop a parquet/Arrow file at
+  `data/raw/imbalance_prices.arrow` with columns `ts_utc, isp` (hourly mean
+  of the two half-hour periods).
+- **Outage features**: would help but A80 ZIP parser isn't implemented yet;
+  EvoTrees ignores the empty column harmlessly in the meantime.
+- **GB wind forecast (BMRS WINDFOR)**: forward-looking only; you can pull
+  it live but not backfill years of history. The feature gets zero gain
+  on backtest and the model ignores it.
+
+## Real-data backtest results
+
+On 6 months of real SEM DAM data (2025-11 → 2026-04, 2332 valid hours after
+DST and gap handling):
+
+| Metric | Naive D-1 | Model |
+|---|---:|---:|
+| MAE  | 37.68 €/MWh | **23.91 €/MWh** |
+| RMSE | 54.36 €/MWh | 35.80 €/MWh |
+| Skill (MAE) | — | **+36.5%** |
+
+Top-10 features by gain on real data: `residual_demand`, `price_roll7_same_hour`,
+`price_lag_168h`, `wind_fcst`, `load_fcst`, **`wind_fcst_mae_7d`**, `price_lag_24h`,
+`daily_mean_wind_fcst`, **`gb_price_lag_24h`**, `daily_mean_price_d_minus_1`.
+
+Forecast-error rolling features and GB cross-market lags both land in the
+top 12, validating the v2 feature build. Calendar neighborhood and DST
+flags show zero gain on this 6-month slice (too few rare events to learn);
+they should recover on a longer training window.
+
 The synthetic generator produces plausible-looking series with the right
 structural features (two-peak demand, wind-driven price suppression, weekly
 cycle, occasional spikes) — enough to verify the pipeline runs end-to-end.
