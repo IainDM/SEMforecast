@@ -19,7 +19,7 @@ const ME_STATIONS = (
     malin_head   = 1575,   # Malin Head, Donegal (north tip)
     valentia     = 2275,   # Valentia Observatory, Kerry (SW)
     roches_point = 1075,   # Roches Point, Cork (SE)
-    dublin       = 175 ,   # NB — fix once we have the real station ID list
+    dublin       = 532,    # Dublin Airport — Met Éireann synoptic station
 )
 
 const ME_BASE_URL = "https://cli.fusio.net/cli/climate_data/webdata"
@@ -72,13 +72,28 @@ end
 """
     fetch_metereann_panel(start_date, end_date) -> DataFrame
 
-Fetches all five stations + Dublin temperature, returns one wide table keyed
-on `ts_utc` with columns named per station.
+Fetches all five coastal stations + Dublin temperature, returns one wide table
+keyed on `ts_utc` with columns named per station.
+
+A failure on any single station logs a warning and is replaced with an
+all-NaN placeholder so downstream feature engineering (which references each
+station by name, e.g. `temp_dublin`) doesn't crash.
 """
 function fetch_metereann_panel(start_date::Date, end_date::Date)
     out = nothing
     for (name, sid) in pairs(ME_STATIONS)
-        df = fetch_metereann_station(sid, start_date, end_date)
+        df = try
+            fetch_metereann_station(sid, start_date, end_date)
+        catch e
+            @warn "Met Éireann station $(name) (id $sid) fetch failed; using NaN placeholder" exception=(e, catch_backtrace())
+            DataFrame(
+                ts_utc     = DateTime[],
+                wind_speed = Float64[],
+                wind_dir   = Float64[],
+                temp       = Float64[],
+                pressure   = Float64[],
+            )
+        end
         rename!(df,
             :wind_speed => Symbol("wind_$(name)"),
             :wind_dir   => Symbol("winddir_$(name)"),
@@ -86,6 +101,16 @@ function fetch_metereann_panel(start_date::Date, end_date::Date)
             :pressure   => Symbol("pressure_$(name)"),
         )
         out = out === nothing ? df : outerjoin(out, df, on = :ts_utc)
+    end
+    # Ensure every expected station column exists even if a station returned
+    # an empty df and the outer-join dropped it.
+    for (name, _) in pairs(ME_STATIONS)
+        for prefix in ("wind_", "winddir_", "temp_", "pressure_")
+            col = Symbol("$(prefix)$(name)")
+            if !(col in propertynames(out))
+                out[!, col] = fill(NaN, nrow(out))
+            end
+        end
     end
     sort!(out, :ts_utc)
     return out
