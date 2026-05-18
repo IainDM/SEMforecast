@@ -217,17 +217,24 @@ function fetch_day_ahead_prices(start_date::Date, end_date::Date)
     return df
 end
 
+# SEM load/generation series are published under separate IE and NI EICs;
+# the unified SEM_EIC works only for the day-ahead price (A44).
+const IE_EIC = "10YIE-1001A00010"
+
 """
     fetch_load_forecast(start_date, end_date) -> DataFrame
 
-Day-ahead total load forecast (ENTSO-E A65 / processType A01).
+Day-ahead total load forecast (ENTSO-E A65 / processType A01) for the IE
+bidding zone (NI load is not separately published to ENTSO-E and IE accounts
+for the bulk of SEM demand).
+
 Columns: `ts_utc::DateTime`, `load_fcst::Float64` (MW).
 """
 function fetch_load_forecast(start_date::Date, end_date::Date)
     params = Dict(
         "documentType"            => "A65",
         "processType"             => "A01",
-        "outBiddingZone_Domain"   => Config.SEM_EIC,
+        "outBiddingZone_Domain"   => IE_EIC,
     )
     df = _fetch_series(params, "quantity", start_date, end_date)
     rename!(df, :value => :load_fcst)
@@ -271,6 +278,55 @@ function fetch_solar_forecast(start_date::Date, end_date::Date)
         @warn "Solar forecast fetch failed ($e); returning zeros"
         return DataFrame(ts_utc = DateTime[], solar_fcst = Float64[])
     end
+end
+
+"""
+    fetch_load_actual(start_date, end_date) -> DataFrame
+
+Actual total load (ENTSO-E A65 with processType A16). Use this together with
+`fetch_load_forecast` to compute realised forecast errors for the rolling-MAE
+features. Columns: `ts_utc`, `load_actual` (MW).
+"""
+function fetch_load_actual(start_date::Date, end_date::Date)
+    params = Dict(
+        "documentType"          => "A65",
+        "processType"           => "A16",
+        "outBiddingZone_Domain" => IE_EIC,
+    )
+    df = _fetch_series(params, "quantity", start_date, end_date)
+    rename!(df, :value => :load_actual)
+    return df
+end
+
+"""
+    fetch_wind_actual(start_date, end_date) -> DataFrame
+
+Actual onshore wind generation (ENTSO-E A75 — Actual Generation per Type,
+psrType B19). Pair with `fetch_wind_forecast` for forecast errors.
+Columns: `ts_utc`, `wind_actual` (MW).
+"""
+function fetch_wind_actual(start_date::Date, end_date::Date)
+    params = Dict(
+        "documentType" => "A75",
+        "processType"  => "A16",
+        "in_Domain"    => Config.SEM_EIC,
+        "psrType"      => "B19",
+    )
+    df = _fetch_series(params, "quantity", start_date, end_date)
+    rename!(df, :value => :wind_actual)
+    return df
+end
+
+"""
+    fetch_actuals_panel(start_date, end_date) -> DataFrame
+
+Convenience wrapper that fetches both actuals and inner-joins on `ts_utc`,
+matching the shape of the synthetic `actuals` output.
+"""
+function fetch_actuals_panel(start_date::Date, end_date::Date)
+    la = fetch_load_actual(start_date, end_date)
+    wa = fetch_wind_actual(start_date, end_date)
+    return innerjoin(la, wa, on = :ts_utc)
 end
 
 """

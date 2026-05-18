@@ -31,26 +31,38 @@ Columns: `ts_utc::DateTime`, `gb_price::Float64` (£/MWh).
 function fetch_gb_da_prices(start_date::Date, end_date::Date;
                             provider::AbstractString = "APXMIDP")
     rows = NamedTuple[]
-    # BMRS limits each call to ~1 month; chunk monthly.
     cursor = start_date
+    # BMRS MID supports broader windows than WINDFOR but isn't documented;
+    # chunk weekly to stay well inside any limit and let single-chunk
+    # failures degrade gracefully.
     while cursor < end_date
-        nxt = min(cursor + Day(31), end_date)
+        nxt = min(cursor + Day(7), end_date)
         url = "$(BMRS_BASE)/datasets/MID?from=$(cursor)&to=$(nxt)&format=json"
-        resp = HTTP.get(url, BMRS_HEADERS; readtimeout = 30, retry = true, retries = 2)
-        j = JSON3.read(resp.body)
-        for r in j.data
-            String(r.dataProvider) == provider || continue
-            push!(rows, (
-                ts_utc = DateTime(String(r.startTime)[1:19]),
-                price  = Float64(r.price),
-            ))
+        try
+            resp = HTTP.get(url, BMRS_HEADERS; readtimeout = 30,
+                            retry = true, retries = 2, status_exception = false)
+            if resp.status == 200
+                j = JSON3.read(resp.body)
+                for r in j.data
+                    String(r.dataProvider) == provider || continue
+                    push!(rows, (
+                        ts_utc = DateTime(String(r.startTime)[1:19]),
+                        price  = Float64(r.price),
+                    ))
+                end
+            elseif resp.status == 400
+                @debug "BMRS MID 400 for $cursor..$nxt; skipping"
+            else
+                @warn "BMRS MID $(resp.status) for $cursor..$nxt"
+            end
+        catch e
+            @warn "MID fetch failed for $cursor..$nxt: $e"
         end
         cursor = nxt
-        sleep(0.3)
+        sleep(0.2)
     end
     df = DataFrame(rows)
     isempty(df) && return DataFrame(ts_utc = DateTime[], gb_price = Float64[])
-    # Aggregate two half-hour settlement periods to hourly mean.
     df.hour_ts = floor.(df.ts_utc, Hour)
     out = combine(groupby(df, :hour_ts), :price => mean => :gb_price)
     rename!(out, :hour_ts => :ts_utc)
@@ -68,24 +80,38 @@ Columns: `ts_utc`, `gb_wind_fcst::Float64` (MW).
 function fetch_gb_wind_forecast(start_date::Date, end_date::Date)
     rows = NamedTuple[]
     cursor = start_date
+    # WINDFOR enforces a 7-day window per request — chunk accordingly.
     while cursor < end_date
-        nxt = min(cursor + Day(31), end_date)
+        nxt = min(cursor + Day(7), end_date)
         url = "$(BMRS_BASE)/datasets/WINDFOR?from=$(cursor)&to=$(nxt)&format=json"
-        resp = HTTP.get(url, BMRS_HEADERS; readtimeout = 30, retry = true, retries = 2)
-        j = JSON3.read(resp.body)
-        for r in j.data
-            push!(rows, (
-                ts_utc        = DateTime(String(r.startTime)[1:19]),
-                gb_wind_fcst  = Float64(r.generation),
-            ))
+        try
+            resp = HTTP.get(url, BMRS_HEADERS; readtimeout = 30,
+                            retry = true, retries = 2, status_exception = false)
+            if resp.status == 200
+                j = JSON3.read(resp.body)
+                for r in j.data
+                    push!(rows, (
+                        ts_utc        = DateTime(String(r.startTime)[1:19]),
+                        gb_wind_fcst  = Float64(r.generation),
+                    ))
+                end
+            elseif resp.status == 400
+                # BMRS often returns 400 for date ranges with no published
+                # forecasts (e.g. far in the past). Just skip.
+                @debug "BMRS WINDFOR 400 for $cursor..$nxt; skipping"
+            else
+                @warn "BMRS WINDFOR $(resp.status) for $cursor..$nxt"
+            end
+        catch e
+            @warn "WINDFOR fetch failed for $cursor..$nxt: $e"
         end
         cursor = nxt
-        sleep(0.3)
+        sleep(0.2)
     end
     df = DataFrame(rows)
     isempty(df) && return DataFrame(ts_utc = DateTime[], gb_wind_fcst = Float64[])
-    # Deduplicate (BMRS publishes multiple forecasts; keep the latest publishTime
-    # per (ts_utc) — simplest is to take mean which is close enough for hourly).
+    # Deduplicate (BMRS publishes multiple forecasts per delivery hour);
+    # taking the mean is close enough for hourly.
     out = combine(groupby(df, :ts_utc), :gb_wind_fcst => mean => :gb_wind_fcst)
     sort!(out, :ts_utc)
     return out

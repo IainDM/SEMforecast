@@ -62,49 +62,38 @@ function main()
         Commodities.save(Commodities.synthetic_commodities(start_date, end_date),
                          "commodities")
     else
-        @info "Fetching ENTSO-E SEM day-ahead prices"
-        Entsoe.save(Entsoe.fetch_day_ahead_prices(start_date, end_date), "dam_prices")
-        @info "Fetching ENTSO-E SEM load forecast"
-        Entsoe.save(Entsoe.fetch_load_forecast(start_date, end_date),    "load_forecast")
-        @info "Fetching ENTSO-E SEM wind forecast"
-        Entsoe.save(Entsoe.fetch_wind_forecast(start_date, end_date),    "wind_forecast")
-        @info "Fetching ENTSO-E SEM solar forecast"
-        Entsoe.save(Entsoe.fetch_solar_forecast(start_date, end_date),   "solar_forecast")
-        @info "Fetching ENTSO-E SEM imbalance settlement prices"
-        Entsoe.save(Entsoe.fetch_imbalance_prices(start_date, end_date), "imbalance_prices")
-        @info "Fetching ENTSO-E SEM generator outages (A77)"
-        try
-            Entsoe.save(Entsoe.fetch_outages(start_date, end_date), "outages")
-        catch e
-            @warn "Outage fetch failed ($e); skipping (rerun once issue resolved)"
+        # All fetchers wrapped: keep going even if a single source breaks.
+        function _safe(label, action)
+            @info "Fetching $label"
+            try
+                action()
+            catch e
+                @warn "$label fetch failed ($e); skipping"
+            end
         end
-        @info "Fetching ELEXON BMRS GB day-ahead prices"
-        try
-            Gb.save(Gb.fetch_gb_da_prices(start_date, end_date), "gb_da_prices")
-        catch e
-            @warn "GB price fetch failed ($e); skipping"
-        end
-        @info "Fetching ELEXON BMRS GB wind forecast"
-        try
-            Gb.save(Gb.fetch_gb_wind_forecast(start_date, end_date), "gb_wind_forecast")
-        catch e
-            @warn "GB wind fetch failed ($e); skipping"
-        end
-        @info "Fetching Met Éireann coastal weather"
-        try
-            Weather.save(Weather.fetch_metereann_panel(start_date, end_date), "weather")
-        catch e
-            @warn "Met Éireann fetch failed ($e); will fall back to no-weather features"
-        end
-        @info "Fetching NOAA CPC NAO index"
-        try
-            ClimateIndices.save(
-                ClimateIndices.nao_daily(start_date, end_date), "nao_index")
-        catch e
-            @warn "NAO fetch failed ($e); skipping"
-        end
-        @info "Fetching TTF gas + EUA carbon (Yahoo Finance)"
-        Commodities.save(Commodities.daily_commodities(start_date, end_date), "commodities")
+        _safe("ENTSO-E SEM day-ahead prices",   () -> Entsoe.save(Entsoe.fetch_day_ahead_prices(start_date, end_date), "dam_prices"))
+        _safe("ENTSO-E SEM load forecast (IE)", () -> Entsoe.save(Entsoe.fetch_load_forecast(start_date, end_date),    "load_forecast"))
+        _safe("ENTSO-E SEM wind forecast",      () -> Entsoe.save(Entsoe.fetch_wind_forecast(start_date, end_date),    "wind_forecast"))
+        _safe("ENTSO-E SEM solar forecast",     () -> Entsoe.save(Entsoe.fetch_solar_forecast(start_date, end_date),   "solar_forecast"))
+        _safe("ENTSO-E SEM actual load + wind (for rolling-MAE)",
+              () -> Entsoe.save(Entsoe.fetch_actuals_panel(start_date, end_date),  "actuals"))
+        # SEM does not publish imbalance settlement prices to ENTSO-E A85 —
+        # the basis model can't be trained on real data without sourcing ISP
+        # elsewhere (e.g. SEMO publication portal).
+        @info "Skipping imbalance prices: SEM does not publish ISP to ENTSO-E A85"
+        # SEM publishes generator unavailability via A80 (zipped XML) rather
+        # than A77. Skipping until A80 fetcher is implemented.
+        @info "Skipping outages: SEM uses A80 (ZIP) rather than A77; not yet implemented"
+        _safe("ELEXON BMRS GB day-ahead prices",
+              () -> Gb.save(Gb.fetch_gb_da_prices(start_date, end_date),       "gb_da_prices"))
+        _safe("ELEXON BMRS GB wind forecast",
+              () -> Gb.save(Gb.fetch_gb_wind_forecast(start_date, end_date),   "gb_wind_forecast"))
+        _safe("Met Éireann coastal weather",
+              () -> Weather.save(Weather.fetch_metereann_panel(start_date, end_date), "weather"))
+        _safe("NOAA CPC NAO index",
+              () -> ClimateIndices.save(ClimateIndices.nao_daily(start_date, end_date), "nao_index"))
+        _safe("TTF gas + EUA carbon (Yahoo)",
+              () -> Commodities.save(Commodities.daily_commodities(start_date, end_date), "commodities"))
     end
 
     @info "Done. Cache files written to $(Config.RAW_DIR) and $(Config.COMMODITIES_DIR)."

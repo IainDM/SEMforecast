@@ -37,7 +37,11 @@ function fetch_yahoo_daily(symbol::AbstractString, start_date::Date, end_date::D
     ts = r.timestamp
     closes = r.indicators.quote[1].close
     dates = Date.(unix2datetime.(Int.(ts)))
-    df = DataFrame(date = dates, close = collect(Union{Missing,Float64}, closes))
+    # JSON3 parses JSON null as `nothing`; convert to `missing` before
+    # building the DataFrame so dropmissing works.
+    closes_clean = Union{Missing,Float64}[c === nothing ? missing : Float64(c)
+                                          for c in closes]
+    df = DataFrame(date = dates, close = closes_clean)
     dropmissing!(df, :close)
     sort!(df, :date)
     return df
