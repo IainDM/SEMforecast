@@ -9,6 +9,7 @@ using Arrow
 using Printf
 using Random
 using Statistics
+using ZipFile
 
 using ..Config
 
@@ -383,6 +384,208 @@ function fetch_outages(start_date::Date, end_date::Date)
         outage_capacity_mw = Float64[], unplanned_outage_mw = Float64[],
         large_outage_flag = Int[])
     return _aggregate_outages(out)
+end
+
+# ---------------------------------------------------------------------------
+# A80 unavailability (ZIP-of-XML) — what SEM actually publishes
+# ---------------------------------------------------------------------------
+#
+# A77 is empty for SEM. Generator unavailability for the SEM bidding zone is
+# served as an A80 "Unavailability of production and generation units"
+# document, returned as `application/zip` containing one XML per outage event.
+# When the requested window has no events, ENTSO-E still returns an
+# Acknowledgement XML (handled by `_is_no_data`).
+
+# Parallel to `_request`: returns either (:xml, doc) for Acknowledgement-style
+# responses or (:zip, body_bytes) for the data path.
+function _request_zip(params::Dict{String,String}; retries::Int = 2)
+    url = _build_url(params)
+    last_err = nothing
+    for attempt in 1:(retries + 1)
+        try
+            resp = HTTP.get(url; readtimeout = 120, retry = false,
+                            status_exception = false)
+            if resp.status == 200
+                ct = lowercase(String(HTTP.header(resp, "Content-Type", "")))
+                if occursin("zip", ct) || occursin("octet-stream", ct)
+                    return (:zip, Vector{UInt8}(resp.body))
+                else
+                    # Acknowledgement / inline XML — let the caller handle it
+                    # via the existing _is_no_data path.
+                    return (:xml, parsexml(resp.body))
+                end
+            elseif resp.status == 429
+                @warn "ENTSO-E rate limited (429), backing off"
+                sleep(5.0 * attempt)
+            elseif resp.status >= 500
+                @warn "ENTSO-E $(resp.status), retrying" attempt
+                sleep(2.0 * attempt)
+            else
+                error("ENTSO-E HTTP $(resp.status): $(String(resp.body)[1:min(end,500)])")
+            end
+        catch e
+            last_err = e
+            attempt > retries && rethrow(e)
+            sleep(2.0 * attempt)
+        end
+    end
+    error("ENTSO-E (zip) request failed after retries: $last_err")
+end
+
+# Open a ZIP body and return parsed XML documents whose archive entry name
+# looks like an unavailability XML (the SEM A80 archives are named e.g.
+# `001-UNAVAILABILITY_OF_PRODUCTION_AND_GENERATION_UNITS_<eic>.xml`).
+function _unzip_outage_docs(zip_bytes::Vector{UInt8})
+    docs = EzXML.Document[]
+    r = ZipFile.Reader(IOBuffer(zip_bytes))
+    try
+        for f in r.files
+            occursin(r"\.xml$"i, f.name) || continue
+            occursin(r"unavail|outage|production"i, f.name) || continue
+            data = read(f)
+            try
+                push!(docs, parsexml(data))
+            catch e
+                @warn "Failed to parse A80 archive entry; skipping" name=f.name exception=e
+            end
+        end
+    finally
+        close(r)
+    end
+    return docs
+end
+
+"""
+    fetch_outages_a80(start_date, end_date) -> DataFrame
+
+Generator unavailability via ENTSO-E A80 (zipped XML). SEM publishes outages
+through this endpoint rather than A77; output schema matches `fetch_outages`
+so callers and feature engineering can swap one for the other.
+
+Columns: `ts_utc::DateTime`, `outage_capacity_mw::Float64`,
+`unplanned_outage_mw::Float64`, `large_outage_flag::Int`.
+"""
+function fetch_outages_a80(start_date::Date, end_date::Date)
+    base = Dict(
+        "documentType"       => "A80",
+        "biddingZone_Domain" => Config.SEM_EIC,
+    )
+    out = Tuple{DateTime,Float64,Float64,Int}[]
+    for (a, b) in _chunks(start_date, end_date)
+        params = copy(base)
+        params["periodStart"] = _entsoe_period(ZonedDateTime(DateTime(a), tz"UTC"))
+        params["periodEnd"]   = _entsoe_period(ZonedDateTime(DateTime(b), tz"UTC"))
+        tag, payload = _request_zip(params)
+        if tag === :xml
+            _is_no_data(payload) && (sleep(0.4); continue)
+            # Inline (non-zipped) Unavailability document — parse with the A80
+            # schema, not A77.
+            append!(out, _parse_outages_a80(payload))
+        else
+            for doc in _unzip_outage_docs(payload)
+                append!(out, _parse_outages_a80(doc))
+            end
+        end
+        sleep(0.4)
+    end
+    isempty(out) && return DataFrame(ts_utc = DateTime[],
+        outage_capacity_mw = Float64[], unplanned_outage_mw = Float64[],
+        large_outage_flag = Int[])
+    return _aggregate_outages(out)
+end
+
+# A80 documents are structured differently from A77:
+#   <Unavailability_MarketDocument>
+#     <TimeSeries>
+#       <businessType>A53|A54</businessType>          -- planned / forced
+#       <start_DateAndOrTime.date>…</…>               -- separate date + time
+#       <start_DateAndOrTime.time>…</…>
+#       <end_DateAndOrTime.date>…</…>
+#       <end_DateAndOrTime.time>…</…>
+#       <production_RegisteredResource.pSRType.powerSystemResources.nominalP unit="MAW">…</…>
+#       <Available_Period>                            -- one per TimeSeries
+#         <timeInterval><start/><end/></timeInterval>
+#         <resolution>PT1M|PT15M|PT30M|PT60M</resolution>
+#         <Point><position/><quantity/></Point>        -- piecewise-constant
+#       </Available_Period>
+#     </TimeSeries>
+#   </Unavailability_MarketDocument>
+#
+# The `<quantity>` is the AVAILABLE capacity remaining (MW); offline is the
+# nominal minus available. With `curveType=A03` the value is held until the
+# next Point — so to expand to hourly we walk one hour at a time and look up
+# the most recent Point.
+function _parse_outages_a80(doc)
+    rows = Tuple{DateTime,Float64,Float64,Int}[]
+    for ts_node in _children(root(doc), "TimeSeries")
+        btype = _child_text(ts_node, "businessType")
+        unplanned = btype == "A54"
+
+        # Nominal capacity (deep field name, exact match needed).
+        nominal = let
+            n = _first_child(ts_node,
+                "production_RegisteredResource.pSRType.powerSystemResources.nominalP")
+            if n === nothing
+                0.0
+            else
+                v = strip(nodecontent(n))
+                try parse(Float64, v) catch; 0.0 end
+            end
+        end
+        nominal <= 0.0 && continue
+
+        for ap in _children(ts_node, "Available_Period")
+            ti = _first_child(ap, "timeInterval")
+            ti === nothing && continue
+            start_text = _child_text(ti, "start")
+            end_text   = _child_text(ti, "end")
+            (start_text === nothing || end_text === nothing) && continue
+            start_utc = _parse_utc(start_text)
+            end_utc   = _parse_utc(end_text)
+            res_text  = _child_text(ap, "resolution")
+            res_text === nothing && continue
+            step = _parse_resolution(res_text)
+
+            points = Tuple{Int,Float64}[]
+            for pt in _children(ap, "Point")
+                pos_text = _child_text(pt, "position")
+                qty_text = _child_text(pt, "quantity")
+                (pos_text === nothing || qty_text === nothing) && continue
+                push!(points, (parse(Int, pos_text), parse(Float64, qty_text)))
+            end
+            sort!(points; by = first)
+            isempty(points) && continue
+
+            # Step duration in minutes.
+            step_min = Dates.value(step)
+
+            # First hour to emit: ceiling of start_utc to the next hour.
+            current = floor(start_utc, Hour)
+            current < start_utc && (current += Hour(1))
+            while current < end_utc
+                # Position is 1-indexed relative to step from start_utc.
+                offset_min = Dates.value(current - start_utc) ÷ 60_000
+                pos = offset_min ÷ step_min + 1
+                # Find the most recent Point with position <= pos. Default to
+                # the first Point's quantity if pos < points[1][1].
+                avail = points[1][2]
+                for (p, q) in points
+                    if p <= pos
+                        avail = q
+                    else
+                        break
+                    end
+                end
+                offline = max(0.0, nominal - avail)
+                if offline > 0.0
+                    push!(rows, (current, offline, unplanned ? offline : 0.0,
+                                 offline > 300.0 ? 1 : 0))
+                end
+                current += Hour(1)
+            end
+        end
+    end
+    return rows
 end
 
 # Per-document parse: emit one row per (timestamp, available_capacity,

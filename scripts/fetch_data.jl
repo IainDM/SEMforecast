@@ -81,9 +81,9 @@ function main()
         # the basis model can't be trained on real data without sourcing ISP
         # elsewhere (e.g. SEMO publication portal).
         @info "Skipping imbalance prices: SEM does not publish ISP to ENTSO-E A85"
-        # SEM publishes generator unavailability via A80 (zipped XML) rather
-        # than A77. Skipping until A80 fetcher is implemented.
-        @info "Skipping outages: SEM uses A80 (ZIP) rather than A77; not yet implemented"
+        # SEM publishes generator unavailability via A80 (zipped XML).
+        _safe("ENTSO-E SEM generator outages (A80)",
+              () -> Entsoe.save(Entsoe.fetch_outages_a80(start_date, end_date), "outages"))
         _safe("ELEXON BMRS GB day-ahead prices",
               () -> Gb.save(Gb.fetch_gb_da_prices(start_date, end_date),       "gb_da_prices"))
         _safe("ELEXON BMRS GB wind forecast",
