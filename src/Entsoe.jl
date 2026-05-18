@@ -88,12 +88,15 @@ function _child_text(node, name)
     c === nothing ? nothing : strip(nodecontent(c))
 end
 
-# Resolution string like "PT60M", "PT30M", "PT15M", "PT1H" -> Minute.
+# Resolution string like "PT60M", "PT30M", "PT15M", "PT1M", "PT1H" -> Minute.
+# A80 outage docs commonly emit PT1M (curveType=A03 holds the value until
+# the next Point, so the small step is fine).
 function _parse_resolution(s::AbstractString)
     s == "PT60M" && return Minute(60)
     s == "PT1H"  && return Minute(60)
     s == "PT30M" && return Minute(30)
     s == "PT15M" && return Minute(15)
+    s == "PT1M"  && return Minute(1)
     s == "P1Y"   && return Minute(60 * 24 * 365)  # not expected, but safe
     error("Unsupported ENTSO-E resolution: $s")
 end
@@ -476,14 +479,27 @@ function fetch_outages_a80(start_date::Date, end_date::Date)
         params["periodStart"] = _entsoe_period(ZonedDateTime(DateTime(a), tz"UTC"))
         params["periodEnd"]   = _entsoe_period(ZonedDateTime(DateTime(b), tz"UTC"))
         tag, payload = _request_zip(params)
+        # A80 returns the full outage window for any event whose validity
+        # overlaps the requested period, so we filter to the chunk's
+        # [chunk_a, chunk_b) window to avoid double-counting events that
+        # span chunk boundaries.
+        chunk_lo = DateTime(a)
+        chunk_hi = DateTime(b)
+        _push_in_window = (rows) -> begin
+            for row in rows
+                if chunk_lo <= row[1] < chunk_hi
+                    push!(out, row)
+                end
+            end
+        end
         if tag === :xml
             _is_no_data(payload) && (sleep(0.4); continue)
             # Inline (non-zipped) Unavailability document — parse with the A80
             # schema, not A77.
-            append!(out, _parse_outages_a80(payload))
+            _push_in_window(_parse_outages_a80(payload))
         else
             for doc in _unzip_outage_docs(payload)
-                append!(out, _parse_outages_a80(doc))
+                _push_in_window(_parse_outages_a80(doc))
             end
         end
         sleep(0.4)
